@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 from parser import Parser
-
+import asyncio
 from dotenv import load_dotenv
 import os
 
@@ -28,7 +28,6 @@ active_events = {}
 
 @tasks.loop(minutes=5.0)
 async def monitor_loop():
-    # Если ивентов нет, останавливаем луп для экономии ресурсов
     if not active_events:
         monitor_loop.stop()
         return
@@ -40,12 +39,15 @@ async def monitor_loop():
         parser = Parser(
             host=server_cfg["host"], 
             port=server_cfg["port"],
-            jedi_prefixes=JEDI_PREFIXES,
+            jedi_prefixes=JEDI_PREFIXES, 
+            ranks=RANKS
         )
         try:
-            players = parser.parse_players()
+            # Запускаем тяжелый сетевой парсер в ОТДЕЛЬНОМ потоке,
+            # чтобы он не блокировал Discord
+            players = await asyncio.to_thread(parser.parse_players)
+            
             for p in players:
-                # Фильтруем только 327 и добавляем в set (дубли исключены)
                 if p.bat == "327" and p.name:
                     data["players"].add(p.name)
         except Exception as e:
