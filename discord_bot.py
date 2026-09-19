@@ -15,7 +15,7 @@ SERVERS = {
     2: {"host": os.getenv('S2_IP'), "port": int(os.getenv('S2_PORT'))}
 }
 
-JEDI_PREFIXES = os.get_env('JEDI_PREFIXES').split(',') 
+JEDI_PREFIXES = os.getenv('JEDI_PREFIXES').split(',') 
 
 
 
