@@ -1,10 +1,7 @@
 services:
-  app:
-    build:
-      context: .
-      network: host
-    network_mode: host
-    command: ["python", "-u", "discord_bot.py"]
-    restart: unless-stopped
-    volumes:
-      - .:/app
+  discord_bot:
+    build: .
+    container_name: 327_event_bot
+    restart: always
+    env_file:
+      - .env

@@ -1,90 +1,158 @@
-import discord
-from discord.ext import commands, tasks
-from parser import Parser
-import asyncio
-from dotenv import load_dotenv
 import os
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import tasks
+from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv('BOT_TOKEN')
+TOKEN = os.getenv("DISCORD_TOKEN")
+VPS_1_IP = os.getenv("VPS_1_IP")
+API_PORT = os.getenv("API_PORT", "4443")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 
-# Настройки IP и портов серверов
-SERVERS = {
-    1: {"host": os.getenv('S1_IP'), "port": int(os.getenv('S1_PORT'))},
-    2: {"host": os.getenv('S2_IP'), "port": int(os.getenv('S2_PORT'))}
-}
+if not TOKEN or not VPS_1_IP or not API_SECRET_KEY:
+    raise RuntimeError("Ошибка: Заполните переменные DISCORD_TOKEN, VPS_1_IP и API_SECRET_KEY в .env!")
 
-JEDI_PREFIXES = os.getenv('JEDI_PREFIXES').split(',') 
+API_URL = f"http://{VPS_1_IP}:{API_PORT}/online/327"
 
+class EventBot(discord.Client):
+    def __init__(self):
+        # Намерения: для слэш-команд достаточно дефолтных
+        intents = discord.Intents.default()
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
+    async def setup_hook(self):
+        # Регистрация слэш-команд в Discord при старте
+        await self.tree.sync()
+        print("[Система] Слэш-команды успешно синхронизированы!")
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='/', intents=intents)
+bot = EventBot()
 
-# Хранилище: {channel_id: {"server_id": id, "players": set()}}
+# Хранилище сессий ивентов: {channel_id: {"server_id": int, "players": set()}}
 active_events = {}
 
 @tasks.loop(minutes=5.0)
 async def monitor_loop():
+    """Каждые 5 минут опрашивает API на VPS №1."""
     if not active_events:
         monitor_loop.stop()
+        print("[Мониторинг] Нет активных событий. Фоновый цикл остановлен.")
         return
 
-    for channel_id, data in list(active_events.items()):
-        server_id = data["server_id"]
-        server_cfg = SERVERS[server_id]
-        
-        parser = Parser(
-            host=server_cfg["host"], 
-            port=server_cfg["port"],
-            jedi_prefixes=JEDI_PREFIXES, 
+    headers = {"X-API-Key": API_SECRET_KEY}
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for channel_id, event_data in list(active_events.items()):
+            server_id = event_data["server_id"]
+            try:
+                params = {"server": server_id}
+                async with session.get(API_URL, params=params, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        players = data.get("players", [])
+                        
+                        # Добавляем в set() — дубли исключаются автоматически
+                        for player_nick in players:
+                            event_data["players"].add(player_nick)
+
+                        print(f"[Успех] Канал {channel_id}: Сервер {server_id} опрошен. "
+                              f"Онлайн сейчас: {len(players)}. Всего уникальных за ивент: {len(event_data['players'])}")
+                    
+                    elif resp.status == 403:
+                        print("[Ошибка 403] Неверный API_SECRET_KEY! Проверьте .env.")
+                    else:
+                        print(f"[Ошибка API] Сервер {server_id} ответил со статусом: {resp.status}")
+
+            except aiohttp.ClientConnectorError:
+                print(f"[Сетевая ошибка] Не удалось подключиться к {API_URL}. Проверьте фаервол UFW на VPS №1.")
+            except Exception as e:
+                print(f"[Ошибка мониторинга]: {e}")
+
+@bot.event
+async def on_ready():
+    print("=" * 40)
+    print(f"Бот успешно запущен: {bot.user.name} (ID: {bot.user.id})")
+    print("Статус: ОНЛАЙН")
+    print("=" * 40)
+
+# ==================== СЛЭШ-КОМАНДЫ ====================
+
+@bot.tree.command(name="eventstart", description="Начать сбор онлайна для ивента")
+@app_commands.describe(server_num="Номер сервера (1 или 2)")
+@app_commands.choices(server_num=[
+    app_commands.Choice(name="Сервер 1", value=1),
+    app_commands.Choice(name="Сервер 2", value=2)
+])
+async def eventstart(interaction: discord.Interaction, server_num: app_commands.Choice[int]):
+    channel_id = interaction.channel_id
+    server_id = server_num.value
+
+    # Защита от двойного запуска в одном канале
+    if channel_id in active_events:
+        await interaction.response.send_message(
+            "⚠️ В этой ветке **уже идет** сбор онлайна! Завершите его командой `/eventend`.",
+            ephemeral=True
         )
-        try:
-            # Запускаем тяжелый сетевой парсер в ОТДЕЛЬНОМ потоке,
-            # чтобы он не блокировал Discord
-            players = await asyncio.to_thread(parser.parse_players)
-            
-            for p in players:
-                if p.bat == "327" and p.name:
-                    data["players"].add(p.name)
-        except Exception as e:
-            print(f"[Ошибка мониторинга сервера {server_id}]: {e}")
-
-@bot.command()
-async def eventstart(ctx, server_num: int):
-    if server_num not in SERVERS:
-        await ctx.send("Неверный номер сервера. Доступны: 1 или 2.")
-        return
-    
-    if ctx.channel.id in active_events:
-        await ctx.send("В этой ветке уже идет мониторинг!")
         return
 
-    # Инициализация множества (set) для исключения дублей
-    active_events[ctx.channel.id] = {"server_id": server_num, "players": set()}
-    await ctx.send(f"Мониторинг сервера #{server_num} запущен каждые 5 минут.")
-    
+    # Инициализация хранилища (set гарантирует уникальность)
+    active_events[channel_id] = {
+        "server_id": server_id,
+        "players": set()
+    }
+
+    await interaction.response.send_message(
+        f"🟢 Мониторинг **Сервера #{server_id}** запущен в этой ветке!\n"
+        f"Опрос базы данных происходит раз в 5 минут. По окончании введите `/eventend`."
+    )
+
+    # Запуск цикла, если он спал
     if not monitor_loop.is_running():
         monitor_loop.start()
 
-@bot.command()
-async def eventend(ctx):
-    if ctx.channel.id not in active_events:
-        await ctx.send("В этой ветке нет активного события.")
-        return
-    
-    players = active_events[ctx.channel.id]["players"]
-    
-    if players:
-        # Сортируем список по алфавиту для красоты
-        result = "\n".join(sorted(players))
-        await ctx.send(f"**Список 327 на ивенте:**\n```{result}```")
-    else:
-        await ctx.send("За время ивента игроки из 327 не были замечены.")
-    
-    # Полное удаление данных из оперативной памяти
-    del active_events[ctx.channel.id]
 
-bot.run(TOKEN)
+@bot.tree.command(name="eventend", description="Завершить ивент и получить список игроков")
+async def eventend(interaction: discord.Interaction):
+    channel_id = interaction.channel_id
+
+    if channel_id not in active_events:
+        await interaction.response.send_message(
+            "❌ В этой ветке нет активного ивента! Запустите его командой `/eventstart`.",
+            ephemeral=True
+        )
+        return
+
+    event_info = active_events[channel_id]
+    server_id = event_info["server_id"]
+    players = event_info["players"]
+
+    if players:
+        # Сортировка по алфавиту
+        sorted_players = sorted(list(players))
+        
+        # Нумерованный список
+        player_list_str = "\n".join(f"{i}. {nick}" for i, nick in enumerate(sorted_players, start=1))
+
+        # Защита от лимита сообщений Discord (макс 2000 символов)
+        if len(player_list_str) > 1900:
+            msg = f"📋 **Итоги ивента (Сервер #{server_id})**\n" \
+                  f"Всего бойцов: **{len(players)}**\n" \
+                  f"```{player_list_str[:1800]}...\n(список обрезан из-за лимита символов)```"
+        else:
+            msg = f"📋 **Итоги ивента (Сервер #{server_id})**\n" \
+                  f"Всего бойцов: **{len(players)}**\n" \
+                  f"```{player_list_str}```"
+    else:
+        msg = f"ℹ️ За время ивента на **Сервере #{server_id}** никто из 327 не зафиксирован."
+
+    await interaction.response.send_message(msg)
+
+    # Очистка памяти для этого канала
+    del active_events[channel_id]
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
