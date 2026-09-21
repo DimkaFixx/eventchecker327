@@ -39,7 +39,7 @@ async def monitor_loop():
         parser = Parser(
             host=server_cfg["host"], 
             port=server_cfg["port"],
-            jedi_prefixes=JEDI_PREFIXES,
+            jedi_prefixes=JEDI_PREFIXES, 
         )
         try:
             # Запускаем тяжелый сетевой парсер в ОТДЕЛЬНОМ потоке,
