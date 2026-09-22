@@ -3,12 +3,11 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
-from datetime import time, timezone, timedelta
+from datetime import datetime, time, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Загрузка переменных окружения
 TOKEN = os.getenv("DISCORD_TOKEN")
 VPS_1_IP = os.getenv("VPS_1_IP")
 API_PORT = os.getenv("API_PORT", "4443")
@@ -22,8 +21,7 @@ API_URL = f"http://{VPS_1_IP}:{API_PORT}/online/327"
 # Московский часовой пояс (UTC+3)
 MSK_TZ = timezone(timedelta(hours=3))
 
-# Расписание: опрос каждые 5 минут, начиная с 01-й и 06-й минут часа
-# (01, 06, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56)
+# Расписание: опрос каждые 5 минут в 01 и 06 минуты часа
 SCHEDULE_TIMES = [
     time(hour=h, minute=m, tzinfo=MSK_TZ)
     for h in range(24)
@@ -37,17 +35,16 @@ class EventBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # Синхронизация слэш-команд с серверами Discord
         await self.tree.sync()
         print("[Система] Слэш-команды успешно синхронизированы!")
 
 bot = EventBot()
 
-# Хранилище сессий: {channel_id: {"server_id": int, "players": set()}}
+# Хранилище: {channel_id: {"server_id": int, "players": set(), "start_time": datetime}}
 active_events = {}
 
 async def poll_server(channel_id: int):
-    """Делает асинхронный HTTP-запрос к API на VPS №1 и обновляет список игроков."""
+    """Делает асинхронный HTTP-запрос к API на VPS №1."""
     if channel_id not in active_events:
         return
 
@@ -64,7 +61,6 @@ async def poll_server(channel_id: int):
                     data = await resp.json()
                     players = data.get("players", [])
                     
-                    # Множество (set) гарантирует отсутствие дублей
                     for player_nick in players:
                         event_data["players"].add(player_nick)
 
@@ -72,22 +68,21 @@ async def poll_server(channel_id: int):
                           f"найдено {len(players)} чел. Всего за ивент: {len(event_data['players'])}")
                 
                 elif resp.status == 403:
-                    print("[Ошибка 403] Неверный API_SECRET_KEY! Проверьте .env файл.")
+                    print("[Ошибка 403] Неверный API_SECRET_KEY!")
                 else:
                     print(f"[Ошибка API] Сервер {server_id} вернул HTTP-код {resp.status}")
 
     except aiohttp.ClientConnectorError:
-        print(f"[Сетевая ошибка] Не удалось достучаться до {API_URL}. Проверьте фаервол UFW на VPS №1.")
+        print(f"[Сетевая ошибка] Не удалось подключиться к {API_URL}.")
     except Exception as e:
         print(f"[Ошибка мониторинга]: {e}")
 
-# Фоновый планировщик строго по расписанию (01 и 06 минуты)
 @tasks.loop(time=SCHEDULE_TIMES)
 async def monitor_loop():
     if not active_events:
         return
 
-    print("[Расписание] Наступило время опроса по графику. Проверяем сервера...")
+    print("[Расписание] Наступило время планового опроса. Проверяем...")
     for channel_id in list(active_events.keys()):
         await poll_server(channel_id)
 
@@ -110,7 +105,6 @@ async def eventstart(interaction: discord.Interaction, server_num: app_commands.
     channel_id = interaction.channel_id
     server_id = server_num.value
 
-    # Защита от запуска в одной и той же ветке
     if channel_id in active_events:
         await interaction.response.send_message(
             "⚠️ В этой ветке **уже идет** мониторинг! Сначала завершите его командой `/eventend`.",
@@ -118,22 +112,25 @@ async def eventstart(interaction: discord.Interaction, server_num: app_commands.
         )
         return
 
-    # Создаем запись в ОЗУ
+    now_msk = datetime.now(MSK_TZ)
+
+    # Сохраняем время старта
     active_events[channel_id] = {
         "server_id": server_id,
-        "players": set()
+        "players": set(),
+        "start_time": now_msk
     }
 
-    # Мгновенно отвечаем в Discord, чтобы избежать таймаута интеракции
+    start_str = now_msk.strftime("%H:%M")
     await interaction.response.send_message(
-        f"🟢 Мониторинг **Сервера #{server_id}** запущен в этой ветке!\n"
+        f"🟢 Мониторинг **Сервера #{server_id}** запущен в **{start_str} (МСК)**!\n"
         f"⏳ Делаю первый опрос базы данных..."
     )
 
-    # 1. Первый мгновенный опрос сервера
+    # Первый мгновенный опрос
     await poll_server(channel_id)
 
-    # 2. Запускаем фоновый цикл по расписанию, если он еще не крутится
+    # Запуск планировщика
     if not monitor_loop.is_running():
         monitor_loop.start()
 
@@ -152,26 +149,35 @@ async def eventend(interaction: discord.Interaction):
     event_info = active_events[channel_id]
     server_id = event_info["server_id"]
     players = event_info["players"]
+    start_time = event_info["start_time"]
+    end_time = datetime.now(MSK_TZ)
 
-    # Очищаем память сразу же
+    # Очищаем память
     del active_events[channel_id]
+
+    time_range_str = f"{start_time.strftime('%H:%M')} – {end_time.strftime('%H:%M')} (МСК)"
 
     if not players:
         await interaction.response.send_message(
-            f"ℹ️ За время ивента на **Сервере #{server_id}** бойцы 327 не зафиксированы."
+            f"ℹ️ Ивент завершен.\n"
+            f"⏰ Время проведения: **{time_range_str}**\n"
+            f"За это время на **Сервере #{server_id}** никто из 327 не зафиксирован."
         )
         return
 
-    # Сортировка по алфавиту и создание нумерованных строк
+    # Сортировка по алфавиту и нумерация
     sorted_players = sorted(list(players))
     numbered_lines = [f"{i}. {nick}" for i, nick in enumerate(sorted_players, start=1)]
 
-    # Отправляем шапку сообщения
-    await interaction.response.send_message(
-        f"📋 **Итоги ивента (Сервер #{server_id})**\nВсего бойцов: **{len(players)}** чел."
+    # Шапка сообщения с указанием диапазона времени
+    header_msg = (
+        f"📋 **Итоги ивента (Сервер #{server_id})**\n"
+        f"⏰ Время проведения: **{time_range_str}**\n"
+        f"👥 Всего бойцов: **{len(players)}** чел."
     )
+    await interaction.response.send_message(header_msg)
 
-    # Дробим список на блоки до 1900 символов внутри ``` для удобного копирования
+    # Вывод списка блоками ``` для удобного копирования
     chunk = ""
     for line in numbered_lines:
         if len(chunk) + len(line) + 1 > 1900:
@@ -179,7 +185,6 @@ async def eventend(interaction: discord.Interaction):
             chunk = ""
         chunk += line + "\n"
 
-    # Отправляем остаток
     if chunk:
         await interaction.followup.send(f"```{chunk.strip()}```")
 
