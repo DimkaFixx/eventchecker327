@@ -134,7 +134,6 @@ async def eventstart(interaction: discord.Interaction, server_num: app_commands.
     if not monitor_loop.is_running():
         monitor_loop.start()
 
-
 @bot.tree.command(name="eventend", description="Завершить ивент и получить список игроков")
 async def eventend(interaction: discord.Interaction):
     channel_id = interaction.channel_id
@@ -168,25 +167,31 @@ async def eventend(interaction: discord.Interaction):
     # Сортировка по алфавиту и нумерация
     sorted_players = sorted(list(players))
     numbered_lines = [f"{i}. {nick}" for i, nick in enumerate(sorted_players, start=1)]
+    player_list_str = "\n".join(numbered_lines)
 
-    # Шапка сообщения с указанием диапазона времени
-    header_msg = (
+    # Шапка сообщения
+    header = (
         f"📋 **Итоги ивента (Сервер #{server_id})**\n"
         f"⏰ Время проведения: **{time_range_str}**\n"
-        f"👥 Всего бойцов: **{len(players)}** чел."
+        f"👥 Всего бойцов: **{len(players)}** чел.\n"
     )
-    await interaction.response.send_message(header_msg)
 
-    # Вывод списка блоками ``` для удобного копирования
-    chunk = ""
-    for line in numbered_lines:
-        if len(chunk) + len(line) + 1 > 1900:
+    # Если всё вместе влезает в лимит одного сообщения (до 2000 символов)
+    full_message = f"{header}```{player_list_str}```"
+    
+    if len(full_message) <= 2000:
+        await interaction.response.send_message(full_message)
+    else:
+        # Если список гигантский и превышает лимит Discord — аккуратно разбиваем
+        await interaction.response.send_message(header)
+        chunk = ""
+        for line in numbered_lines:
+            if len(chunk) + len(line) + 1 > 1900:
+                await interaction.followup.send(f"```{chunk.strip()}```")
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
             await interaction.followup.send(f"```{chunk.strip()}```")
-            chunk = ""
-        chunk += line + "\n"
-
-    if chunk:
-        await interaction.followup.send(f"```{chunk.strip()}```")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
